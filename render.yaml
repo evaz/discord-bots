@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: discord-mod-bot
+    runtime: node
+    plan: starter
+    healthCheckPath: /health
+    buildCommand: npm install
+    startCommand: node src/mod-bot.js
+    envVars:
+      - key: DISCORD_BOT_TOKEN
+        sync: false
+      - key: DISCORD_GUILD_ID
+        sync: false
+      - key: MOD_LOG_CHANNEL_ID
+        sync: false
+      - key: STATUS_WEBHOOK_URL
+        sync: false
+      - key: WARNING_TIMEOUT_MINUTES
+        value: "5"
+      - key: CROSS_POST_THRESHOLD
+        value: "3"

@@ -1,0 +1,496 @@
+/**
+ * Persistent Moderation Bot
+ *
+ * Runs 24/7 and monitors all messages for cross-post spam.
+ * When a user posts the same message in 3+ different channels:
+ *   1. DMs the user a warning with a 5-minute window to self-delete
+ *   2. If not deleted in time, bot deletes all copies and kicks the user
+ *   3. All actions are logged to #mod-log
+ */
+
+const http = require('http');
+const https = require('https');
+const {
+  Client,
+  GatewayIntentBits,
+  EmbedBuilder,
+  PermissionsBitField,
+} = require('discord.js');
+require('dotenv').config({ path: require('path').join(__dirname, '..', '.env') });
+
+const BOT_TOKEN = process.env.DISCORD_BOT_TOKEN;
+const GUILD_ID = process.env.DISCORD_GUILD_ID;
+const MOD_LOG_CHANNEL_ID = process.env.MOD_LOG_CHANNEL_ID;
+const WARNING_TIMEOUT_MINUTES = parseInt(process.env.WARNING_TIMEOUT_MINUTES, 10) || 5;
+const CROSS_POST_THRESHOLD = parseInt(process.env.CROSS_POST_THRESHOLD, 10) || 3;
+const STATUS_WEBHOOK_URL = process.env.STATUS_WEBHOOK_URL;
+const PORT = process.env.PORT || 3000;
+
+if (!BOT_TOKEN || !GUILD_ID) {
+  console.error('Missing required environment variables. Check your .env file.');
+  console.error('Required: DISCORD_BOT_TOKEN, DISCORD_GUILD_ID');
+  process.exit(1);
+}
+
+if (!MOD_LOG_CHANNEL_ID) {
+  console.warn('WARNING: MOD_LOG_CHANNEL_ID not set. Mod actions will only be logged to console.');
+}
+
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent,
+    GatewayIntentBits.GuildMembers,
+  ],
+});
+
+// ── In-memory cross-post tracker ──────────────────────────────────────────
+// Structure: Map<userId, Map<contentHash, { channels: Map<channelId, messageId>, firstSeen: number }>>
+const crossPostCache = new Map();
+
+// How long to keep entries before they expire (10 minutes)
+const CACHE_TTL_MS = 10 * 60 * 1000;
+
+// Active warnings: Map<userId, { contentHash, timeout, channelMessagePairs }>
+const activeWarnings = new Map();
+
+function hashContent(content) {
+  // Normalize: trim, lowercase, collapse whitespace
+  return content.trim().toLowerCase().replace(/\s+/g, ' ');
+}
+
+function cleanExpiredEntries() {
+  const now = Date.now();
+  for (const [userId, contentMap] of crossPostCache) {
+    for (const [hash, data] of contentMap) {
+      if (now - data.firstSeen > CACHE_TTL_MS) {
+        contentMap.delete(hash);
+      }
+    }
+    if (contentMap.size === 0) {
+      crossPostCache.delete(userId);
+    }
+  }
+}
+
+// Run cleanup every 2 minutes
+setInterval(cleanExpiredEntries, 2 * 60 * 1000);
+
+// ── Mod log helper ────────────────────────────────────────────────────────
+
+async function logToModChannel(embed) {
+  if (!MOD_LOG_CHANNEL_ID) return;
+  try {
+    const channel = await client.channels.fetch(MOD_LOG_CHANNEL_ID);
+    if (channel) await channel.send({ embeds: [embed] });
+  } catch (err) {
+    console.error('Failed to send to mod-log:', err.message);
+  }
+}
+
+function timestamp() {
+  return new Date().toISOString();
+}
+
+// ── Core logic ────────────────────────────────────────────────────────────
+
+async function handleMessage(message) {
+  // Ignore bots and DMs
+  if (message.author.bot) return;
+  if (!message.guild) return;
+  if (message.guild.id !== GUILD_ID) return;
+
+  // Ignore empty or very short messages (likely reactions/emoji)
+  const content = message.content;
+  if (!content || content.length < 5) return;
+
+  const userId = message.author.id;
+  const channelId = message.channel.id;
+  const hash = hashContent(content);
+
+  // Initialize user's cache if needed
+  if (!crossPostCache.has(userId)) {
+    crossPostCache.set(userId, new Map());
+  }
+  const userCache = crossPostCache.get(userId);
+
+  // Initialize content entry if needed
+  if (!userCache.has(hash)) {
+    userCache.set(hash, {
+      channels: new Map(),
+      firstSeen: Date.now(),
+    });
+  }
+  const entry = userCache.get(hash);
+
+  // Track this channel+message (one entry per channel, latest message wins)
+  entry.channels.set(channelId, message.id);
+
+  const uniqueChannels = entry.channels.size;
+
+  console.log(
+    `[${timestamp()}] ${message.author.tag} posted in #${message.channel.name} ` +
+    `(${uniqueChannels}/${CROSS_POST_THRESHOLD} channels for this content)`
+  );
+
+  // Check threshold
+  if (uniqueChannels >= CROSS_POST_THRESHOLD && !activeWarnings.has(userId)) {
+    await triggerWarning(message.author, hash, entry);
+  }
+}
+
+async function triggerWarning(user, contentHash, entry) {
+  const channelNames = [];
+
+  for (const [chId] of entry.channels) {
+    try {
+      const ch = await client.channels.fetch(chId);
+      channelNames.push(`#${ch.name}`);
+    } catch {
+      channelNames.push(`<#${chId}>`);
+    }
+  }
+
+  console.log(
+    `[${timestamp()}] WARNING triggered for ${user.tag} - ` +
+    `same message in ${entry.channels.size} channels: ${channelNames.join(', ')}`
+  );
+
+  // Log warning to mod-log
+  const warningEmbed = new EmbedBuilder()
+    .setColor(0xffa500)
+    .setTitle('Cross-Post Warning Issued')
+    .addFields(
+      { name: 'User', value: `${user.tag} (${user.id})`, inline: true },
+      { name: 'Channels', value: channelNames.join(', '), inline: true },
+      { name: 'Threshold', value: `${entry.channels.size}/${CROSS_POST_THRESHOLD}`, inline: true },
+      { name: 'Timeout', value: `${WARNING_TIMEOUT_MINUTES} minutes`, inline: true },
+    )
+    .setTimestamp();
+
+  await logToModChannel(warningEmbed);
+
+  // DM the user
+  try {
+    await user.send(
+      `Hey! Just a heads up — it looks like you posted the same message in ${entry.channels.size} channels ` +
+      `(${channelNames.join(', ')}). We'd appreciate it if you kept messages to one channel to avoid clutter.\n\n` +
+      `Could you delete the extra copies in the next **${WARNING_TIMEOUT_MINUTES} minutes**? ` +
+      `If not, we'll go ahead and clean them up automatically — but that would also mean a kick from the server. ` +
+      `No hard feelings, you'd be welcome to rejoin!`
+    );
+    console.log(`[${timestamp()}] DM sent to ${user.tag}`);
+  } catch (err) {
+    console.warn(`[${timestamp()}] Could not DM ${user.tag}: ${err.message}`);
+  }
+
+  // Set timeout for enforcement — uses live cache, not a snapshot
+  const timeout = setTimeout(
+    () => enforceWarning(user, contentHash),
+    WARNING_TIMEOUT_MINUTES * 60 * 1000
+  );
+
+  activeWarnings.set(user.id, {
+    contentHash,
+    timeout,
+  });
+}
+
+async function enforceWarning(user, contentHash) {
+  activeWarnings.delete(user.id);
+
+  // Read ALL channels from the live cache (includes posts made during warning window)
+  const userCache = crossPostCache.get(user.id);
+  const entry = userCache?.get(contentHash);
+  if (!entry || entry.channels.size === 0) {
+    console.log(`[${timestamp()}] No cached messages for ${user.tag} - may have been cleaned up`);
+    return;
+  }
+
+  const channelMessagePairs = entry.channels;
+  console.log(`[${timestamp()}] Enforcing warning for ${user.tag} - checking ${channelMessagePairs.size} messages...`);
+
+  const stillPresent = [];
+
+  // Check which messages are still present
+  for (const [channelId, messageId] of channelMessagePairs) {
+    try {
+      const channel = await client.channels.fetch(channelId);
+      const msg = await channel.messages.fetch(messageId);
+      if (msg) stillPresent.push({ channel, message: msg });
+    } catch {
+      // Message was deleted or inaccessible - that's fine
+    }
+  }
+
+  // If user deleted enough, stand down
+  if (stillPresent.length < CROSS_POST_THRESHOLD) {
+    console.log(
+      `[${timestamp()}] ${user.tag} resolved the issue ` +
+      `(${stillPresent.length} copies remain, below threshold)`
+    );
+
+    const resolvedEmbed = new EmbedBuilder()
+      .setColor(0x00ff00)
+      .setTitle('Cross-Post Warning Resolved')
+      .addFields(
+        { name: 'User', value: `${user.tag} (${user.id})`, inline: true },
+        { name: 'Remaining copies', value: `${stillPresent.length}`, inline: true },
+      )
+      .setTimestamp();
+
+    await logToModChannel(resolvedEmbed);
+    return;
+  }
+
+  // Delete remaining messages
+  let deletedCount = 0;
+  const affectedChannels = [];
+
+  for (const { channel, message } of stillPresent) {
+    try {
+      await message.delete();
+      deletedCount++;
+      affectedChannels.push(`#${channel.name}`);
+      console.log(`[${timestamp()}] Deleted message ${message.id} in #${channel.name}`);
+    } catch (err) {
+      console.error(`[${timestamp()}] Failed to delete ${message.id}: ${err.message}`);
+    }
+  }
+
+  // Kick the user
+  let kicked = false;
+  try {
+    const guild = await client.guilds.fetch(GUILD_ID);
+    const member = await guild.members.fetch(user.id);
+    await member.kick('Cross-post spam - did not remove duplicates after warning');
+    kicked = true;
+    console.log(`[${timestamp()}] Kicked ${user.tag}`);
+  } catch (err) {
+    console.error(`[${timestamp()}] Failed to kick ${user.tag}: ${err.message}`);
+  }
+
+  // Try to DM the user about the action taken
+  try {
+    await user.send(
+      `Hey — since the duplicate messages weren't removed in time, we went ahead and cleaned them up. ` +
+      `You've been kicked from the server, but you're welcome to rejoin. Just please keep messages to one channel next time!`
+    );
+  } catch {
+    // User may have DMs off or left already
+  }
+
+  // Log enforcement to mod-log
+  const enforceEmbed = new EmbedBuilder()
+    .setColor(0xff0000)
+    .setTitle('Cross-Post Enforcement')
+    .addFields(
+      { name: 'User', value: `${user.tag} (${user.id})`, inline: true },
+      { name: 'Messages Deleted', value: `${deletedCount}`, inline: true },
+      { name: 'Kicked', value: kicked ? 'Yes' : 'No (insufficient permissions)', inline: true },
+      { name: 'Affected Channels', value: affectedChannels.join(', ') || 'None' },
+    )
+    .setTimestamp();
+
+  await logToModChannel(enforceEmbed);
+
+  // Clean up cache for this user/content
+  if (userCache) {
+    userCache.delete(contentHash);
+    if (userCache.size === 0) crossPostCache.delete(user.id);
+  }
+}
+
+// ── Event listeners ───────────────────────────────────────────────────────
+
+client.once('ready', () => {
+  console.log(`[${timestamp()}] Moderation bot online as ${client.user.tag}`);
+  console.log(`[${timestamp()}] Monitoring guild: ${GUILD_ID}`);
+  console.log(`[${timestamp()}] Cross-post threshold: ${CROSS_POST_THRESHOLD} channels`);
+  console.log(`[${timestamp()}] Warning timeout: ${WARNING_TIMEOUT_MINUTES} minutes`);
+  console.log(`[${timestamp()}] Mod log channel: ${MOD_LOG_CHANNEL_ID || '(not set)'}`);
+});
+
+client.on('messageCreate', handleMessage);
+
+client.on('error', (err) => {
+  console.error(`[${timestamp()}] Client error:`, err.message);
+});
+
+process.on('SIGINT', () => {
+  console.log(`\n[${timestamp()}] Shutting down...`);
+  client.destroy();
+  process.exit(0);
+});
+
+process.on('SIGTERM', () => {
+  console.log(`\n[${timestamp()}] Received SIGTERM, shutting down...`);
+  client.destroy();
+  process.exit(0);
+});
+
+// ── Status page webhook server ────────────────────────────────────────────
+// Receives POST from Statuspage.io (status.vapi.ai) and forwards to Discord.
+// Webhook subscriber added on 2026-03-04:
+//   https://discord-mod-bot-rfjh.onrender.com/webhook/status
+// Configured in Vapi's Statuspage.io dashboard under Subscribers > Webhook.
+
+function getStatusColor(status, impact) {
+  if (status === 'resolved' || status === 'postmortem' || status === 'operational') return 0x00ff00;
+  if (impact === 'critical' || impact === 'major' || status === 'major_outage') return 0xff0000;
+  return 0xffa500;
+}
+
+function parseBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    req.on('data', (chunk) => chunks.push(chunk));
+    req.on('end', () => {
+      try {
+        resolve(JSON.parse(Buffer.concat(chunks).toString()));
+      } catch (err) {
+        reject(err);
+      }
+    });
+    req.on('error', reject);
+  });
+}
+
+function postToDiscordWebhook(payload) {
+  return new Promise((resolve, reject) => {
+    const data = JSON.stringify(payload);
+    const url = new URL(STATUS_WEBHOOK_URL);
+    const options = {
+      hostname: url.hostname,
+      path: url.pathname,
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) },
+    };
+    const req = https.request(options, (res) => {
+      let body = '';
+      res.on('data', (chunk) => { body += chunk; });
+      res.on('end', () => resolve({ statusCode: res.statusCode, body }));
+    });
+    req.on('error', reject);
+    req.write(data);
+    req.end();
+  });
+}
+
+function buildIncidentEmbed(incident) {
+  const latestUpdate = incident.incident_updates?.[0] || {};
+  const updateBody = latestUpdate.body || 'No details provided.';
+  const link = incident.shortlink || 'https://status.vapi.ai';
+  const color = getStatusColor(incident.status, incident.impact);
+  const incidentTime = latestUpdate.created_at || latestUpdate.updated_at
+    || incident.updated_at || incident.created_at || new Date().toISOString();
+
+  return {
+    color,
+    title: incident.name || 'Status Update',
+    url: link,
+    description: updateBody,
+    fields: [
+      { name: 'Status', value: incident.status || 'unknown', inline: true },
+      { name: 'Impact', value: incident.impact || 'none', inline: true },
+    ],
+    timestamp: incidentTime,
+  };
+}
+
+function buildComponentEmbed(component, componentUpdate) {
+  const oldStatus = componentUpdate.old_status?.replace(/_/g, ' ') || 'unknown';
+  const newStatus = componentUpdate.new_status?.replace(/_/g, ' ') || 'unknown';
+  const color = getStatusColor(componentUpdate.new_status, null);
+  const eventTime = componentUpdate.created_at || new Date().toISOString();
+
+  return {
+    color,
+    title: `${component.name || 'Component'} Status Change`,
+    url: 'https://status.vapi.ai',
+    description: `**${component.name}** changed from **${oldStatus}** to **${newStatus}**.`,
+    fields: [
+      { name: 'Component', value: component.name || 'unknown', inline: true },
+      { name: 'Status', value: newStatus, inline: true },
+    ],
+    timestamp: eventTime,
+  };
+}
+
+async function handleStatusWebhook(req, res) {
+  if (!STATUS_WEBHOOK_URL) {
+    res.writeHead(500, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'STATUS_WEBHOOK_URL not configured' }));
+    return;
+  }
+
+  let body;
+  try {
+    body = await parseBody(req);
+  } catch {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Invalid JSON' }));
+    return;
+  }
+
+  console.log(`[${timestamp()}] Webhook received:`, JSON.stringify(body).substring(0, 500));
+
+  let embed;
+  let label;
+
+  if (body.incident) {
+    embed = buildIncidentEmbed(body.incident);
+    label = `${body.incident.name} (${body.incident.status})`;
+  } else if (body.component && body.component_update) {
+    embed = buildComponentEmbed(body.component, body.component_update);
+    label = `${body.component.name} (${body.component_update.new_status})`;
+  } else {
+    console.warn(`[${timestamp()}] Unknown webhook payload:`, JSON.stringify(body).substring(0, 500));
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Unrecognized payload format' }));
+    return;
+  }
+
+  try {
+    const result = await postToDiscordWebhook({ embeds: [embed] });
+    if (result.statusCode >= 200 && result.statusCode < 300) {
+      console.log(`[${timestamp()}] Status update posted: ${label}`);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    } else {
+      console.error(`[${timestamp()}] Discord webhook returned ${result.statusCode}: ${result.body}`);
+      res.writeHead(502, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Discord webhook failed', detail: result.body }));
+    }
+  } catch (err) {
+    console.error(`[${timestamp()}] Failed to post status update:`, err.message);
+    res.writeHead(500, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Failed to post to Discord' }));
+  }
+}
+
+const server = http.createServer(async (req, res) => {
+  if (req.method === 'GET' && req.url === '/health') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ status: 'ok' }));
+    return;
+  }
+
+  if (req.method === 'POST' && req.url === '/webhook/status') {
+    await handleStatusWebhook(req, res);
+    return;
+  }
+
+  res.writeHead(404, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ error: 'Not found' }));
+});
+
+server.listen(PORT, () => {
+  console.log(`[${timestamp()}] HTTP server listening on port ${PORT}`);
+});
+
+// ── Start ─────────────────────────────────────────────────────────────────
+
+console.log('Starting moderation bot...');
+client.login(BOT_TOKEN);
