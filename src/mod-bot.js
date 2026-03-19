@@ -52,7 +52,7 @@ const crossPostCache = new Map();
 // How long to keep entries before they expire (10 minutes)
 const CACHE_TTL_MS = 10 * 60 * 1000;
 
-// Active warnings: Map<userId, { contentHash, timeout, channelMessagePairs }>
+// Active warnings: Map<userId, { timeout }>
 const activeWarnings = new Map();
 
 // Produces a stable fingerprint for cross-post detection.
@@ -63,7 +63,12 @@ function hashContent(content, attachments, stickers) {
   const parts = [];
 
   const text = content?.trim().toLowerCase().replace(/\s+/g, ' ');
-  if (text && text.length >= 5) parts.push(text);
+  if (text && text.length >= 5) {
+    // Use first 15 words as a fuzzy fingerprint so slightly-varied copies
+    // of the same message (e.g. spam templates) produce the same hash.
+    const fingerprint = text.split(' ').slice(0, 15).join(' ');
+    parts.push(fingerprint);
+  }
 
   // Attachments: fingerprint by sorted "filename:size" pairs.
   // Same file re-uploaded gets a new CDN URL but keeps the same name+size.
@@ -162,10 +167,11 @@ async function handleMessage(message) {
     `(${uniqueChannels}/${CROSS_POST_THRESHOLD} channels for this content)`
   );
 
-  // Check threshold
+  // Check cross-post threshold
   if (uniqueChannels >= CROSS_POST_THRESHOLD && !activeWarnings.has(userId)) {
     await triggerWarning(message.author, hash, entry);
   }
+
 }
 
 async function triggerWarning(user, contentHash, entry) {
@@ -219,10 +225,7 @@ async function triggerWarning(user, contentHash, entry) {
     WARNING_TIMEOUT_MINUTES * 60 * 1000
   );
 
-  activeWarnings.set(user.id, {
-    contentHash,
-    timeout,
-  });
+  activeWarnings.set(user.id, { timeout });
 }
 
 async function enforceWarning(user, contentHash) {
@@ -364,9 +367,15 @@ process.on('SIGTERM', () => {
 //   https://discord-mod-bot-rfjh.onrender.com/webhook/status
 // Configured in Vapi's Statuspage.io dashboard under Subscribers > Webhook.
 
-function getStatusColor(status, impact) {
+// Better Stack payload format:
+//   body.event_type: "incident" | "maintenance" | "component_update"
+//   body.page.status_indicator: "operational" | "degraded" | "downtime" | "maintenance"
+//   body.incident / body.maintenance / body.component (depending on event_type)
+//   Component events: old status is body.component.previous_status, new status is body.component.status
+
+function getStatusColor(status) {
   if (status === 'resolved' || status === 'postmortem' || status === 'operational') return 0x00ff00;
-  if (impact === 'critical' || impact === 'major' || status === 'major_outage') return 0xff0000;
+  if (status === 'downtime' || status === 'major_outage') return 0xff0000;
   return 0xffa500;
 }
 
@@ -406,32 +415,39 @@ function postToDiscordWebhook(payload) {
   });
 }
 
-function buildIncidentEmbed(incident) {
-  const latestUpdate = incident.incident_updates?.[0] || {};
+// Handles both "incident" and "maintenance" event types (same shape, different key).
+function buildIncidentEmbed(report, pageStatus) {
+  const updates = report.incident_updates || report.maintenance_updates || [];
+  const latestUpdate = updates[0] || {};
   const updateBody = latestUpdate.body || 'No details provided.';
-  const link = incident.shortlink || 'https://status.vapi.ai';
-  const color = getStatusColor(incident.status, incident.impact);
-  const incidentTime = latestUpdate.created_at || latestUpdate.updated_at
-    || incident.updated_at || incident.created_at || new Date().toISOString();
+  const link = report.shortlink || 'https://status.vapi.ai';
+  const color = getStatusColor(pageStatus);
+  const eventTime = latestUpdate.created_at || latestUpdate.updated_at
+    || report.updated_at || report.created_at || new Date().toISOString();
+
+  const fields = [
+    { name: 'Status', value: (pageStatus || 'unknown').replace(/_/g, ' '), inline: true },
+  ];
+  if (report.starts_at) {
+    fields.push({ name: 'Starts', value: report.starts_at, inline: true });
+    fields.push({ name: 'Ends', value: report.ends_at || 'TBD', inline: true });
+  }
 
   return {
     color,
-    title: incident.name || 'Status Update',
+    title: report.name || 'Status Update',
     url: link,
     description: updateBody,
-    fields: [
-      { name: 'Status', value: incident.status || 'unknown', inline: true },
-      { name: 'Impact', value: incident.impact || 'none', inline: true },
-    ],
-    timestamp: incidentTime,
+    fields,
+    timestamp: eventTime,
   };
 }
 
-function buildComponentEmbed(component, componentUpdate) {
-  const oldStatus = componentUpdate.old_status?.replace(/_/g, ' ') || 'unknown';
-  const newStatus = componentUpdate.new_status?.replace(/_/g, ' ') || 'unknown';
-  const color = getStatusColor(componentUpdate.new_status, null);
-  const eventTime = componentUpdate.created_at || new Date().toISOString();
+function buildComponentEmbed(component) {
+  const oldStatus = (component.previous_status || 'unknown').replace(/_/g, ' ');
+  const newStatus = (component.status || 'unknown').replace(/_/g, ' ');
+  const color = getStatusColor(component.status);
+  const eventTime = component.updated_at || new Date().toISOString();
 
   return {
     color,
@@ -464,15 +480,20 @@ async function handleStatusWebhook(req, res) {
 
   console.log(`[${timestamp()}] Webhook received:`, JSON.stringify(body).substring(0, 500));
 
+  const eventType = body.event_type;
+  const pageStatus = body.page?.status_indicator;
   let embed;
   let label;
 
-  if (body.incident) {
-    embed = buildIncidentEmbed(body.incident);
-    label = `${body.incident.name} (${body.incident.status})`;
-  } else if (body.component && body.component_update) {
-    embed = buildComponentEmbed(body.component, body.component_update);
-    label = `${body.component.name} (${body.component_update.new_status})`;
+  if (eventType === 'incident' && body.incident) {
+    embed = buildIncidentEmbed(body.incident, pageStatus);
+    label = `${body.incident.name} (${pageStatus})`;
+  } else if (eventType === 'maintenance' && body.maintenance) {
+    embed = buildIncidentEmbed(body.maintenance, pageStatus);
+    label = `${body.maintenance.name} (maintenance)`;
+  } else if (eventType === 'component_update' && body.component) {
+    embed = buildComponentEmbed(body.component);
+    label = `${body.component.name} (${body.component.previous_status} → ${body.component.status})`;
   } else {
     console.warn(`[${timestamp()}] Unknown webhook payload:`, JSON.stringify(body).substring(0, 500));
     res.writeHead(400, { 'Content-Type': 'application/json' });
